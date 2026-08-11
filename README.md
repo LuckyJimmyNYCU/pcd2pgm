@@ -9,4 +9,5 @@ ros2 launch pcd2pgm run.launch.py
 改名字與參數都在
 config/pcd2pgm.yaml
 
-<img width="960" height="1706" alt="S__23437315" src="https://github.com/user-attachments/assets/71e56ccf-bf02-4c8c-83ea-078aa8ce5bcb" />
+<img width="960" height="1706" alt="S__23437315" src="https://github.com/user-attachments/assets/9c047dda-2aed-4fad-aa95-daeb7d3002db" />
+
