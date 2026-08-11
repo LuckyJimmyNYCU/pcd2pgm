@@ -2,48 +2,55 @@ pcd2pgm:
   ros__parameters:
 
     # ======================================================================
-    # 平常只改這一行
+    # Normally, only change this line
     # ======================================================================
-    # 讀 <world_directory>/<input_subdir>/<map_name>.pcd
-    # 寫 <world_directory>/<output_subdir>/<map_name>/<map_name>.pgm + .yaml
+    # Reads:  <world_directory>/<input_subdir>/<map_name>.pcd
+    # Writes: <world_directory>/<output_subdir>/<map_name>/<map_name>.pgm + .yaml
     map_name: "live_map_8f"
 
     world_directory: "/work/nav2_ws/src/world"
     input_subdir: "PCD"
     output_subdir: "2Dmap"
 
-    # 完整路徑覆寫。非空時優先於上面的組合規則，留空表示不使用。
-    #   input_pcd:       完整輸入路徑，含 .pcd
-    #   output_basepath: 完整輸出路徑，「不含」副檔名，程式會自動接 .pgm / .yaml
-    #   output_name:     只想讓輸出檔名跟 map_name 不同時才填
+    # Full path overrides. When non-empty, these take priority over
+    # the path construction rules above. Leave empty to disable.
+    #   input_pcd:       Full input path, including .pcd
+    #   output_basepath: Full output path, without an extension.
+    #                    The program automatically appends .pgm / .yaml
+    #   output_name:     Fill this only when the output filename should
+    #                    differ from map_name
     input_pcd: ""
     output_basepath: ""
     output_name: ""
 
     thre_z_min: 0.3
-    thre_z_max: 1.1
-    # false = 保留區間內，true = 保留區間外
+    thre_z_max: 0.7
+
+    # false = keep points within the specified height range
+    # true  = keep points outside the specified height range
     flag_pass_through: false
 
     # ======================================================================
-    # 半徑濾波（對高度切片後的點做）
+    # Radius filtering (applied to points after height slicing)
     # ======================================================================
     use_radius_filter: true
-    thre_radius: 0.5
+    thre_radius: 0.8
     thres_point_count: 10
 
     # ======================================================================
-    # 地圖輸出
+    # Map output
     # ======================================================================
     map_resolution: 0.05
     padding: 0.5
 
-    # false: 沒有點的格子填 254（free）。true: 填 205（unknown）。
+    # false: cells without points are filled with 254 (free space).
+    # true:  cells without points are filled with 205 (unknown).
     unknown_as_unknown: false
 
-    # true: 地圖範圍取完整點雲的 XY，與同一份 PCD 產出的其他地圖對齊。
-    # false: 只框住濾波後的障礙物點。
+    # true:  Use the XY bounds of the full point cloud so that this map
+    #       remains aligned with other maps generated from the same PCD.
+    # false: Only bound the map around the filtered obstacle points.
     bounds_from_full_cloud: true
 
-    # 額外輸出 <output>_pass.pcd 與 <output>_radius.pcd 供檢查
-    save_intermediate: false
+    # Save <output>_pass.pcd and <output>_radius.pcd for inspection.
+    save_intermediate: true
