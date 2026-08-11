@@ -5,4 +5,6 @@ colcon build --packages-select pcd2pgm --symlink-install
 
 然後執行
 ros2 launch pcd2pgm run.launch.py 
-只要改config/pcd2pgm.yaml
+
+改名字與參數都在
+config/pcd2pgm.yaml
