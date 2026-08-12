@@ -23,8 +23,36 @@ pcd2pgm:
     output_basepath: ""
     output_name: ""
 
-    thre_z_min: 0.3
-    thre_z_max: 0.7
+    # ======================================================================
+    # Voxel downsampling (applied to the raw cloud, before every other filter)
+    # ======================================================================
+    # Keeps one point per voxel. Speeds up the height and radius filters and
+    # evens out the density, which makes the radius filter behave consistently
+    # across the map. Map bounds still come from the full cloud, so switching
+    # this on does not move the origin or change the map size.
+    use_voxel_filter: true
+
+    # false: downsample AFTER the height filter (recommended). The height band
+    #        has already collapsed the z extent, so the voxel grid stays small.
+    # true:  downsample BEFORE the height filter. The grid then has to span the
+    #        full z range of the cloud, which on a multi-floor or drifted scan
+    #        can exceed PCL's int32 cell index and abort.
+    voxel_before_height_filter: false
+
+    # Leaf size in metres. leaf_x / leaf_y at or below map_resolution keeps
+    # the raster unchanged; above it, thin walls start to develop gaps.
+    # leaf_z can be much larger: the output is a 2D map, so vertical detail
+    # inside the height band does not matter.
+    voxel_leaf_x: 0.05
+    voxel_leaf_y: 0.05
+    voxel_leaf_z: 0.10
+
+    # Keep a voxel only when it holds at least this many points.
+    # 1 = plain downsampling. 2 or 3 also drops isolated noise.
+    voxel_min_points_per_voxel: 1
+
+    thre_z_min: -0.5
+    thre_z_max: 0.65
 
     # false = keep points within the specified height range
     # true  = keep points outside the specified height range

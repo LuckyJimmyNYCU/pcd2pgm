@@ -30,8 +30,10 @@
 
 #include <rclcpp/rclcpp.hpp>
 
+#include <pcl/common/common.h>
 #include <pcl/filters/passthrough.h>
 #include <pcl/filters/radius_outlier_removal.h>
+#include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_types.h>
 
@@ -67,18 +69,47 @@ public:
     }
     RCLCPP_INFO(get_logger(), "Loaded %zu points from %s",
       cloud->points.size(), input_pcd_.string().c_str());
+    logBounds("Input cloud", cloud);
+
+    // ---- optional early downsample ------------------------------------
+    // Only when voxel_before_height_filter is true. This sees the full z
+    // range of the cloud, so the voxel grid can get very large; the height
+    // filter first is usually the better order.
+    CloudT::Ptr work = cloud;
+    if (use_voxel_filter_ && voxel_before_height_filter_) {
+      work = voxelFilter(cloud);
+      if (work->points.empty()) {
+        throw std::runtime_error(
+                "No points left after the voxel filter. Lower "
+                "voxel_min_points_per_voxel or shrink voxel_leaf_*.");
+      }
+    }
 
     // ---- filter -------------------------------------------------------
-    auto passed = passThrough(cloud);
+    auto passed = passThrough(work);
     if (passed->points.empty()) {
       throw std::runtime_error(
               "No points left after the height filter. Check thre_z_min / "
               "thre_z_max against the actual z range of the cloud.");
     }
 
-    CloudT::Ptr obstacles = passed;
+    // ---- downsample ---------------------------------------------------
+    // Default position: the height band has already collapsed the z extent,
+    // so the voxel grid stays small. The original cloud is still used for the
+    // map bounds, so turning this on does not shift the origin or size.
+    CloudT::Ptr downsampled = passed;
+    if (use_voxel_filter_ && !voxel_before_height_filter_) {
+      downsampled = voxelFilter(passed);
+      if (downsampled->points.empty()) {
+        throw std::runtime_error(
+                "No points left after the voxel filter. Lower "
+                "voxel_min_points_per_voxel or shrink voxel_leaf_*.");
+      }
+    }
+
+    CloudT::Ptr obstacles = downsampled;
     if (use_radius_filter_) {
-      obstacles = radiusFilter(passed);
+      obstacles = radiusFilter(downsampled);
       if (obstacles->points.empty()) {
         throw std::runtime_error(
                 "No points left after the radius filter. Lower "
@@ -110,6 +141,22 @@ private:
     output_basepath_override_ = declare_parameter<std::string>("output_basepath", "");
     // Empty means reuse map_name.
     output_name_ = declare_parameter<std::string>("output_name", "");
+
+    // Voxel downsampling. Applied to the raw cloud before every other
+    // filter. leaf_z can be larger than leaf_x / leaf_y: the map is a 2D
+    // raster, so vertical detail inside the height band is not needed.
+    use_voxel_filter_ = declare_parameter<bool>("use_voxel_filter", false);
+    // false = downsample after the height filter (recommended). true = before,
+    // which makes the voxel grid span the full z range of the cloud.
+    voxel_before_height_filter_ =
+      declare_parameter<bool>("voxel_before_height_filter", false);
+    voxel_leaf_x_ = declare_parameter<double>("voxel_leaf_x", 0.05);
+    voxel_leaf_y_ = declare_parameter<double>("voxel_leaf_y", 0.05);
+    voxel_leaf_z_ = declare_parameter<double>("voxel_leaf_z", 0.05);
+    // A voxel is kept only if it contains at least this many points, so
+    // raising it also removes isolated noise. 1 = plain downsampling.
+    voxel_min_points_per_voxel_ =
+      declare_parameter<int>("voxel_min_points_per_voxel", 1);
 
     thre_z_min_ = declare_parameter<double>("thre_z_min", 0.2);
     thre_z_max_ = declare_parameter<double>("thre_z_max", 2.0);
@@ -194,6 +241,84 @@ private:
     RCLCPP_INFO(get_logger(), "map_name: %s", map_name_.c_str());
     RCLCPP_INFO(get_logger(), "Input:    %s", input_pcd_.string().c_str());
     RCLCPP_INFO(get_logger(), "Output:   %s.pgm / .yaml", output_base_.string().c_str());
+  }
+
+  // Prints the XYZ extent of a cloud. Worth looking at when the voxel grid
+  // complains: a span far larger than the building means stray far-away
+  // points, which also inflate the output map because the bounds come from
+  // the full cloud.
+  void logBounds(const char * label, const CloudT::Ptr & cloud)
+  {
+    if (cloud->points.empty()) {
+      return;
+    }
+    Eigen::Vector4f min_pt;
+    Eigen::Vector4f max_pt;
+    pcl::getMinMax3D(*cloud, min_pt, max_pt);
+    RCLCPP_INFO(get_logger(),
+      "%s extent: x [%.2f, %.2f] %.2f m, y [%.2f, %.2f] %.2f m, "
+      "z [%.2f, %.2f] %.2f m",
+      label,
+      min_pt[0], max_pt[0], max_pt[0] - min_pt[0],
+      min_pt[1], max_pt[1], max_pt[1] - min_pt[1],
+      min_pt[2], max_pt[2], max_pt[2] - min_pt[2]);
+  }
+
+  CloudT::Ptr voxelFilter(const CloudT::Ptr & input)
+  {
+    if (voxel_leaf_x_ <= 0.0 || voxel_leaf_y_ <= 0.0 || voxel_leaf_z_ <= 0.0) {
+      throw std::runtime_error("voxel_leaf_x / _y / _z must be greater than zero");
+    }
+
+    // PCL addresses voxels with a single int32 index. If the bounding box
+    // needs more voxels than that, VoxelGrid only prints a warning and hands
+    // the cloud back unfiltered, which is easy to miss in the log. Check it
+    // here and fail with a message that says what to do.
+    Eigen::Vector4f min_pt;
+    Eigen::Vector4f max_pt;
+    pcl::getMinMax3D(*input, min_pt, max_pt);
+
+    const double nx = std::floor((max_pt[0] - min_pt[0]) / voxel_leaf_x_) + 1.0;
+    const double ny = std::floor((max_pt[1] - min_pt[1]) / voxel_leaf_y_) + 1.0;
+    const double nz = std::floor((max_pt[2] - min_pt[2]) / voxel_leaf_z_) + 1.0;
+    const double voxel_count = nx * ny * nz;
+
+    if (voxel_count > static_cast<double>(std::numeric_limits<int32_t>::max())) {
+      RCLCPP_ERROR(get_logger(),
+        "Voxel grid would be %.0f x %.0f x %.0f = %.0f cells over "
+        "x %.2f m, y %.2f m, z %.2f m",
+        nx, ny, nz, voxel_count,
+        max_pt[0] - min_pt[0], max_pt[1] - min_pt[1], max_pt[2] - min_pt[2]);
+      throw std::runtime_error(
+              "voxel grid exceeds PCL's int32 cell index. Fixes, in order of "
+              "preference: (1) set voxel_before_height_filter to false so the "
+              "height band shrinks the z extent first; (2) remove far-away "
+              "stray points from the PCD, which also shrink the output map; "
+              "(3) increase voxel_leaf_x / _y / _z.");
+    }
+
+    auto out = std::make_shared<CloudT>();
+
+    pcl::VoxelGrid<PointT> vg;
+    vg.setInputCloud(input);
+    vg.setLeafSize(
+      static_cast<float>(voxel_leaf_x_),
+      static_cast<float>(voxel_leaf_y_),
+      static_cast<float>(voxel_leaf_z_));
+    vg.setMinimumPointsNumberPerVoxel(
+      static_cast<unsigned int>(std::max(1, voxel_min_points_per_voxel_)));
+    vg.filter(*out);
+
+    RCLCPP_INFO(get_logger(),
+      "After voxel filter (leaf=%.3f/%.3f/%.3f, min_points=%d): "
+      "%zu points (from %zu)",
+      voxel_leaf_x_, voxel_leaf_y_, voxel_leaf_z_, voxel_min_points_per_voxel_,
+      out->points.size(), input->points.size());
+
+    if (save_intermediate_ && !out->points.empty()) {
+      pcl::io::savePCDFileBinary(output_base_.string() + "_voxel.pcd", *out);
+    }
+    return out;
   }
 
   CloudT::Ptr passThrough(const CloudT::Ptr & input)
@@ -372,6 +497,13 @@ private:
 
   fs::path input_pcd_;
   fs::path output_base_;   // no extension
+
+  bool use_voxel_filter_{false};
+  bool voxel_before_height_filter_{false};
+  double voxel_leaf_x_{0.05};
+  double voxel_leaf_y_{0.05};
+  double voxel_leaf_z_{0.05};
+  int voxel_min_points_per_voxel_{1};
 
   double thre_z_min_{0.2};
   double thre_z_max_{2.0};
