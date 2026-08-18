@@ -11,14 +11,25 @@
 // In normal use only map_name changes. Full paths can still be forced with
 // input_pcd and output_basepath.
 //
-// Loads the PCD, keeps a height band with a PassThrough filter, optionally
-// removes sparse points with a RadiusOutlierRemoval filter, rasterises what is
-// left and writes a .pgm + .yaml pair that nav2_map_server can load directly.
+// Pipeline:
+//     load
+//   -> optional statistical outlier removal (SOR)
+//   -> optional coarse absolute-z crop
+//   -> optional early voxel downsample
+//   -> height filter, either
+//        absolute:         keep z inside [thre_z_min, thre_z_max]
+//        ground-relative:  estimate a local ground surface and keep
+//                          (z - ground_z) inside [thre_z_min, thre_z_max]
+//   -> optional voxel downsample
+//   -> optional radius outlier removal
+//   -> rasterise, write .pgm + .yaml that nav2_map_server can load directly
+//
 // No topic is published; the node writes the files and exits.
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <ios>
@@ -33,9 +44,12 @@
 #include <pcl/common/common.h>
 #include <pcl/filters/passthrough.h>
 #include <pcl/filters/radius_outlier_removal.h>
+#include <pcl/filters/statistical_outlier_removal.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_types.h>
+
+#include <CSF.h>
 
 namespace fs = std::filesystem;
 
@@ -71,13 +85,43 @@ public:
       cloud->points.size(), input_pcd_.string().c_str());
     logBounds("Input cloud", cloud);
 
+    // Bounds for the output map are taken from this cloud when
+    // bounds_from_full_cloud is true. SOR runs before it is captured so that
+    // a handful of stray points cannot inflate the map by tens of metres.
+    CloudT::Ptr work = cloud;
+
+    // ---- statistical outlier removal ----------------------------------
+    // Runs first: points floating below the floor would otherwise drag the
+    // ground surface estimate down and open holes in the relative slice.
+    if (use_statistical_filter_) {
+      work = statisticalFilter(work);
+      if (work->points.empty()) {
+        throw std::runtime_error(
+                "No points left after the statistical filter. Raise "
+                "sor_std_ratio or lower sor_mean_k.");
+      }
+      logBounds("After SOR", work);
+    }
+    CloudT::Ptr bounds_cloud = work;
+
+    // ---- coarse absolute-z crop ---------------------------------------
+    // Optional. Trims sky, ceiling and gross z outliers before the ground
+    // surface is estimated. Wide limits are fine; this is not the slice.
+    if (use_coarse_z_filter_) {
+      work = coarseZFilter(work);
+      if (work->points.empty()) {
+        throw std::runtime_error(
+                "No points left after the coarse z filter. Widen "
+                "coarse_z_min / coarse_z_max.");
+      }
+    }
+
     // ---- optional early downsample ------------------------------------
     // Only when voxel_before_height_filter is true. This sees the full z
     // range of the cloud, so the voxel grid can get very large; the height
     // filter first is usually the better order.
-    CloudT::Ptr work = cloud;
     if (use_voxel_filter_ && voxel_before_height_filter_) {
-      work = voxelFilter(cloud);
+      work = voxelFilter(work);
       if (work->points.empty()) {
         throw std::runtime_error(
                 "No points left after the voxel filter. Lower "
@@ -85,11 +129,17 @@ public:
       }
     }
 
-    // ---- filter -------------------------------------------------------
-    auto passed = passThrough(work);
+    // ---- height filter ------------------------------------------------
+    CloudT::Ptr passed = use_ground_relative_slice_
+      ? groundRelativeSlice(work)
+      : passThrough(work);
     if (passed->points.empty()) {
       throw std::runtime_error(
-              "No points left after the height filter. Check thre_z_min / "
+              use_ground_relative_slice_
+              ? "No points left after the ground-relative slice. Check "
+              "thre_z_min / thre_z_max; they are now measured from the "
+              "local ground, so both are usually small positive numbers."
+              : "No points left after the height filter. Check thre_z_min / "
               "thre_z_max against the actual z range of the cloud.");
     }
 
@@ -118,7 +168,7 @@ public:
     }
 
     // ---- rasterise and write ------------------------------------------
-    writeMap(cloud, obstacles);
+    writeMap(bounds_cloud, obstacles);
   }
 
 private:
@@ -142,9 +192,50 @@ private:
     // Empty means reuse map_name.
     output_name_ = declare_parameter<std::string>("output_name", "");
 
-    // Voxel downsampling. Applied to the raw cloud before every other
-    // filter. leaf_z can be larger than leaf_x / leaf_y: the map is a 2D
-    // raster, so vertical detail inside the height band is not needed.
+    // Statistical outlier removal. Drops points whose mean distance to their
+    // sor_mean_k nearest neighbours is more than sor_std_ratio standard
+    // deviations above the cloud average.
+    use_statistical_filter_ = declare_parameter<bool>("use_statistical_filter", false);
+    sor_mean_k_ = declare_parameter<int>("sor_mean_k", 30);
+    sor_std_ratio_ = declare_parameter<double>("sor_std_ratio", 1.0);
+
+    // Coarse absolute-z crop, applied before the ground surface estimate.
+    use_coarse_z_filter_ = declare_parameter<bool>("use_coarse_z_filter", false);
+    coarse_z_min_ = declare_parameter<double>("coarse_z_min", -5.0);
+    coarse_z_max_ = declare_parameter<double>("coarse_z_max", 5.0);
+
+    // Ground-relative slicing. When true, thre_z_min / thre_z_max are
+    // measured from a locally estimated ground surface instead of from z = 0,
+    // so a sloping or drifting floor still yields one consistent slice.
+    use_ground_relative_slice_ =
+      declare_parameter<bool>("use_ground_relative_slice", false);
+    // "csf"  = cloth simulation filter, the method from Zhang et al. 2016
+    // "grid" = per-cell low percentile of the raw cloud
+    ground_method_ = declare_parameter<std::string>("ground_method", "csf");
+
+    // CSF parameters. Same meaning as the reference implementation, so values
+    // that work in the Python CSF module carry over unchanged.
+    csf_slope_smooth_ = declare_parameter<bool>("csf_slope_smooth", true);
+    csf_cloth_resolution_ = declare_parameter<double>("csf_cloth_resolution", 0.5);
+    csf_rigidness_ = declare_parameter<int>("csf_rigidness", 2);
+    csf_class_threshold_ = declare_parameter<double>("csf_class_threshold", 0.2);
+    csf_max_iterations_ = declare_parameter<int>("csf_max_iterations", 500);
+    csf_time_step_ = declare_parameter<double>("csf_time_step", 0.65);
+
+    ground_cell_size_ = declare_parameter<double>("ground_cell_size", 1.0);
+    ground_min_points_per_cell_ =
+      declare_parameter<int>("ground_min_points_per_cell", 5);
+    // 0.0 uses the lowest point in the cell; a small positive value is more
+    // robust to single stray points below the floor.
+    ground_percentile_ = declare_parameter<double>("ground_percentile", 0.05);
+    // Cells more than this far from the median of their known neighbours are
+    // discarded and refilled. 0 disables the check.
+    ground_max_step_ = declare_parameter<double>("ground_max_step", 0.5);
+    ground_smooth_passes_ = declare_parameter<int>("ground_smooth_passes", 2);
+    ground_smooth_alpha_ = declare_parameter<double>("ground_smooth_alpha", 0.5);
+
+    // Voxel downsampling. leaf_z can be larger than leaf_x / leaf_y: the map
+    // is a 2D raster, so vertical detail inside the height band is not needed.
     use_voxel_filter_ = declare_parameter<bool>("use_voxel_filter", false);
     // false = downsample after the height filter (recommended). true = before,
     // which makes the voxel grid span the full z range of the cloud.
@@ -158,6 +249,8 @@ private:
     voxel_min_points_per_voxel_ =
       declare_parameter<int>("voxel_min_points_per_voxel", 1);
 
+    // Absolute when use_ground_relative_slice is false, relative to the local
+    // ground when it is true.
     thre_z_min_ = declare_parameter<double>("thre_z_min", 0.2);
     thre_z_max_ = declare_parameter<double>("thre_z_max", 2.0);
     // false = keep points inside [min, max]; true = keep points outside.
@@ -241,6 +334,18 @@ private:
     RCLCPP_INFO(get_logger(), "map_name: %s", map_name_.c_str());
     RCLCPP_INFO(get_logger(), "Input:    %s", input_pcd_.string().c_str());
     RCLCPP_INFO(get_logger(), "Output:   %s.pgm / .yaml", output_base_.string().c_str());
+    if (use_ground_relative_slice_ &&
+      ground_method_ != "csf" && ground_method_ != "grid")
+    {
+      throw std::runtime_error(
+              "ground_method must be \"csf\" or \"grid\", got \"" +
+              ground_method_ + "\"");
+    }
+
+    const std::string mode = use_ground_relative_slice_
+      ? "ground-relative (" + ground_method_ + ")"
+      : std::string("absolute z");
+    RCLCPP_INFO(get_logger(), "Height filter mode: %s", mode.c_str());
   }
 
   // Prints the XYZ extent of a cloud. Worth looking at when the voxel grid
@@ -262,6 +367,59 @@ private:
       min_pt[0], max_pt[0], max_pt[0] - min_pt[0],
       min_pt[1], max_pt[1], max_pt[1] - min_pt[1],
       min_pt[2], max_pt[2], max_pt[2] - min_pt[2]);
+  }
+
+  // ---------------------------------------------------------------------
+  // Filters
+  // ---------------------------------------------------------------------
+
+  CloudT::Ptr statisticalFilter(const CloudT::Ptr & input)
+  {
+    if (sor_mean_k_ < 1) {
+      throw std::runtime_error("sor_mean_k must be at least 1");
+    }
+    if (static_cast<int>(input->points.size()) <= sor_mean_k_) {
+      throw std::runtime_error(
+              "Cloud has fewer points than sor_mean_k; lower sor_mean_k.");
+    }
+
+    auto out = std::make_shared<CloudT>();
+
+    pcl::StatisticalOutlierRemoval<PointT> sor;
+    sor.setInputCloud(input);
+    sor.setMeanK(sor_mean_k_);
+    sor.setStddevMulThresh(sor_std_ratio_);
+    sor.filter(*out);
+
+    RCLCPP_INFO(get_logger(),
+      "After statistical filter (mean_k=%d, std_ratio=%.3f): %zu points "
+      "(from %zu)",
+      sor_mean_k_, sor_std_ratio_, out->points.size(), input->points.size());
+
+    if (save_intermediate_ && !out->points.empty()) {
+      pcl::io::savePCDFileBinary(output_base_.string() + "_sor.pcd", *out);
+    }
+    return out;
+  }
+
+  CloudT::Ptr coarseZFilter(const CloudT::Ptr & input)
+  {
+    if (coarse_z_min_ >= coarse_z_max_) {
+      throw std::runtime_error("coarse_z_min must be less than coarse_z_max");
+    }
+
+    auto out = std::make_shared<CloudT>();
+
+    pcl::PassThrough<PointT> pass;
+    pass.setInputCloud(input);
+    pass.setFilterFieldName("z");
+    pass.setFilterLimits(
+      static_cast<float>(coarse_z_min_), static_cast<float>(coarse_z_max_));
+    pass.filter(*out);
+
+    RCLCPP_INFO(get_logger(), "After coarse z crop [%.3f, %.3f]: %zu points",
+      coarse_z_min_, coarse_z_max_, out->points.size());
+    return out;
   }
 
   CloudT::Ptr voxelFilter(const CloudT::Ptr & input)
@@ -361,6 +519,557 @@ private:
     }
     return out;
   }
+
+  // ---------------------------------------------------------------------
+  // Ground surface estimation and relative slicing
+  // ---------------------------------------------------------------------
+
+  enum class CellStat
+  {
+    kPercentile,   // low percentile of every point in the cell (grid method)
+    kMean          // mean of the classified ground points (csf method)
+  };
+
+  // Runs CSF and returns the subset of the cloud it classified as ground.
+  //
+  // CSF inverts the cloud in z and drops a simulated cloth onto it, so the
+  // cloth comes to rest on the ground rather than on canopy or rooftops.
+  // Points within csf_class_threshold of the settled cloth are ground.
+  CloudT::Ptr csfGroundPoints(const CloudT::Ptr & input)
+  {
+    if (csf_cloth_resolution_ <= 0.0) {
+      throw std::runtime_error("csf_cloth_resolution must be greater than zero");
+    }
+    if (csf_class_threshold_ <= 0.0) {
+      throw std::runtime_error("csf_class_threshold must be greater than zero");
+    }
+
+    std::vector<csf::Point> pts;
+    pts.reserve(input->points.size());
+    // Index back into the PCL cloud, since non-finite points are skipped and
+    // CSF returns positions in its own compacted vector.
+    std::vector<size_t> source_index;
+    source_index.reserve(input->points.size());
+
+    for (size_t i = 0; i < input->points.size(); ++i) {
+      const auto & p = input->points[i];
+      if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+        continue;
+      }
+      pts.emplace_back(
+        static_cast<double>(p.x), static_cast<double>(p.y),
+        static_cast<double>(p.z));
+      source_index.push_back(i);
+    }
+
+    if (pts.size() < 16) {
+      throw std::runtime_error("Too few finite points to run CSF");
+    }
+
+    RCLCPP_INFO(get_logger(),
+      "Running CSF on %zu points (cloth_resolution=%.3f, rigidness=%d, "
+      "class_threshold=%.3f, iterations=%d, time_step=%.3f, slope_smooth=%s)",
+      pts.size(), csf_cloth_resolution_, csf_rigidness_, csf_class_threshold_,
+      csf_max_iterations_, csf_time_step_, csf_slope_smooth_ ? "true" : "false");
+
+    CSF csf;
+    csf.params.bSloopSmooth = csf_slope_smooth_;
+    csf.params.cloth_resolution = csf_cloth_resolution_;
+    csf.params.rigidness = std::clamp(csf_rigidness_, 1, 3);
+    csf.params.class_threshold = csf_class_threshold_;
+    csf.params.interations = std::max(1, csf_max_iterations_);
+    csf.params.time_step = csf_time_step_;
+    csf.setPointCloud(pts);
+
+    std::vector<int> ground_idx;
+    std::vector<int> offground_idx;
+    // The third argument must stay false: true makes CSF dump cloth_nodes.txt
+    // into the current working directory.
+    csf.do_filtering(ground_idx, offground_idx, false);
+
+    auto out = std::make_shared<CloudT>();
+    out->points.reserve(ground_idx.size());
+    for (int idx : ground_idx) {
+      if (idx < 0 || static_cast<size_t>(idx) >= source_index.size()) {
+        continue;
+      }
+      out->points.push_back(input->points[source_index[static_cast<size_t>(idx)]]);
+    }
+    out->width = static_cast<uint32_t>(out->points.size());
+    out->height = 1;
+    out->is_dense = false;
+
+    RCLCPP_INFO(get_logger(),
+      "CSF ground: %zu points, non-ground: %zu points (%.1f%% ground)",
+      out->points.size(), offground_idx.size(),
+      100.0 * static_cast<double>(out->points.size()) /
+      static_cast<double>(pts.size()));
+
+    if (out->points.empty()) {
+      throw std::runtime_error(
+              "CSF classified no points as ground. Reduce csf_cloth_resolution, "
+              "or raise csf_class_threshold.");
+    }
+
+    if (save_intermediate_) {
+      pcl::io::savePCDFileBinary(output_base_.string() + "_csf_ground.pcd", *out);
+    }
+    return out;
+  }
+
+  // A regular XY grid holding one ground height per cell. Every cell is
+  // finite after buildGroundGrid() returns: unobserved cells are filled from
+  // their nearest known neighbour.
+  struct GroundGrid
+  {
+    std::vector<double> z;
+    int width{0};
+    int height{0};
+    double cell{1.0};
+    double x_min{0.0};
+    double y_min{0.0};
+  };
+
+  // extent_cloud fixes the grid bounds, so the surface always spans every
+  // point that will later be sliced. value_cloud supplies the heights: the
+  // whole cloud for the grid method, the CSF ground subset for the csf one.
+  GroundGrid buildGroundGrid(
+    const CloudT::Ptr & extent_cloud, const CloudT::Ptr & value_cloud,
+    CellStat stat)
+  {
+    if (ground_cell_size_ <= 0.0) {
+      throw std::runtime_error("ground_cell_size must be greater than zero");
+    }
+    if (ground_percentile_ < 0.0 || ground_percentile_ > 1.0) {
+      throw std::runtime_error("ground_percentile must be between 0.0 and 1.0");
+    }
+
+    double x_min = std::numeric_limits<double>::max();
+    double x_max = std::numeric_limits<double>::lowest();
+    double y_min = std::numeric_limits<double>::max();
+    double y_max = std::numeric_limits<double>::lowest();
+    bool any = false;
+
+    for (const auto & p : extent_cloud->points) {
+      if (!std::isfinite(p.x) || !std::isfinite(p.y)) {
+        continue;
+      }
+      x_min = std::min(x_min, static_cast<double>(p.x));
+      x_max = std::max(x_max, static_cast<double>(p.x));
+      y_min = std::min(y_min, static_cast<double>(p.y));
+      y_max = std::max(y_max, static_cast<double>(p.y));
+      any = true;
+    }
+    if (!any) {
+      throw std::runtime_error("Cloud has no finite points for ground estimation");
+    }
+
+    GroundGrid g;
+    g.cell = ground_cell_size_;
+    g.x_min = x_min;
+    g.y_min = y_min;
+    g.width = std::max(2, static_cast<int>(std::floor((x_max - x_min) / g.cell)) + 2);
+    g.height = std::max(2, static_cast<int>(std::floor((y_max - y_min) / g.cell)) + 2);
+
+    const double cell_count =
+      static_cast<double>(g.width) * static_cast<double>(g.height);
+    if (cell_count > 5.0e7) {
+      throw std::runtime_error(
+              "Ground grid would need more than 5e7 cells. Increase "
+              "ground_cell_size, or trim far-away stray points from the PCD.");
+    }
+
+    const size_t n_cells = static_cast<size_t>(g.width) * static_cast<size_t>(g.height);
+
+    // Per-cell z samples. Total storage is one double per contributing point,
+    // which is the same order as the cloud itself.
+    std::vector<std::vector<double>> samples(n_cells);
+    for (const auto & p : value_cloud->points) {
+      if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+        continue;
+      }
+      const int ix = std::clamp(
+        static_cast<int>(std::floor((p.x - g.x_min) / g.cell)), 0, g.width - 1);
+      const int iy = std::clamp(
+        static_cast<int>(std::floor((p.y - g.y_min) / g.cell)), 0, g.height - 1);
+      samples[static_cast<size_t>(iy) * static_cast<size_t>(g.width) +
+        static_cast<size_t>(ix)].push_back(static_cast<double>(p.z));
+    }
+
+    const int min_pts = std::max(1, ground_min_points_per_cell_);
+
+    g.z.assign(n_cells, std::numeric_limits<double>::quiet_NaN());
+    std::vector<uint8_t> known(n_cells, 0);
+    size_t known_count = 0;
+
+    for (size_t i = 0; i < n_cells; ++i) {
+      auto & v = samples[i];
+      if (static_cast<int>(v.size()) < min_pts) {
+        continue;
+      }
+      if (stat == CellStat::kMean) {
+        double sum = 0.0;
+        for (double z : v) {
+          sum += z;
+        }
+        g.z[i] = sum / static_cast<double>(v.size());
+      } else {
+        // Low percentile of the cell rather than the strict minimum, so a
+        // single point below the floor cannot define the ground there.
+        size_t k = static_cast<size_t>(
+          std::llround(ground_percentile_ * static_cast<double>(v.size() - 1)));
+        k = std::min(k, v.size() - 1);
+        std::nth_element(v.begin(), v.begin() + static_cast<long>(k), v.end());
+        g.z[i] = v[k];
+      }
+      known[i] = 1;
+      ++known_count;
+    }
+    samples.clear();
+    samples.shrink_to_fit();
+
+    const double empty_fraction =
+      1.0 - static_cast<double>(known_count) / static_cast<double>(n_cells);
+
+    RCLCPP_INFO(get_logger(),
+      "Ground grid: %d x %d cells @ %.2f m, known %zu / %zu (%.1f%% empty)",
+      g.width, g.height, g.cell, known_count, n_cells, 100.0 * empty_fraction);
+
+    if (known_count == 0) {
+      throw std::runtime_error(
+              "No ground cells were generated. Lower ground_min_points_per_cell "
+              "or increase ground_cell_size.");
+    }
+
+    // A large empty fraction after CSF almost always means the cloth failed to
+    // reach part of the terrain, which shows up as whole regions with no
+    // ground points at all.
+    if (ground_method_ == "csf" && empty_fraction > 0.30) {
+      RCLCPP_WARN(get_logger(),
+        "%.0f%% of the ground grid has no CSF ground points. The cloth "
+        "probably could not follow the terrain. Halve csf_cloth_resolution "
+        "and re-run; see the note on slope x cloth_resolution in the config.",
+        100.0 * empty_fraction);
+    }
+
+    rejectGroundSteps(g, known, known_count);
+    fillNearest(g, known);
+    smoothGrid(g);
+    warnOnSteepness(g);
+    return g;
+  }
+
+  // Discards cells that sit far above or below the median of their known
+  // neighbours. Catches cells whose only returns are a roof, a parked vehicle
+  // or a pallet, which would otherwise lift the local ground and hide real
+  // obstacles standing on it.
+  void rejectGroundSteps(
+    GroundGrid & g, std::vector<uint8_t> & known, size_t & known_count)
+  {
+    if (ground_max_step_ <= 0.0) {
+      return;
+    }
+
+    const std::vector<double> snapshot_z = g.z;
+    const std::vector<uint8_t> snapshot_known = known;
+    size_t rejected = 0;
+
+    for (int y = 0; y < g.height; ++y) {
+      for (int x = 0; x < g.width; ++x) {
+        const size_t idx =
+          static_cast<size_t>(y) * static_cast<size_t>(g.width) +
+          static_cast<size_t>(x);
+        if (!snapshot_known[idx]) {
+          continue;
+        }
+
+        std::vector<double> nb;
+        nb.reserve(8);
+        for (int dy = -1; dy <= 1; ++dy) {
+          for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) {
+              continue;
+            }
+            const int nx = x + dx;
+            const int ny = y + dy;
+            if (nx < 0 || nx >= g.width || ny < 0 || ny >= g.height) {
+              continue;
+            }
+            const size_t n_idx =
+              static_cast<size_t>(ny) * static_cast<size_t>(g.width) +
+              static_cast<size_t>(nx);
+            if (snapshot_known[n_idx]) {
+              nb.push_back(snapshot_z[n_idx]);
+            }
+          }
+        }
+        // Too few neighbours to judge; leave the cell alone.
+        if (nb.size() < 4) {
+          continue;
+        }
+
+        const size_t mid = nb.size() / 2;
+        std::nth_element(nb.begin(), nb.begin() + static_cast<long>(mid), nb.end());
+        const double median = nb[mid];
+
+        if (std::fabs(snapshot_z[idx] - median) > ground_max_step_) {
+          known[idx] = 0;
+          g.z[idx] = std::numeric_limits<double>::quiet_NaN();
+          ++rejected;
+        }
+      }
+    }
+
+    known_count -= rejected;
+    RCLCPP_INFO(get_logger(),
+      "Ground step rejection (max_step=%.3f m): dropped %zu cells, %zu remain",
+      ground_max_step_, rejected, known_count);
+
+    if (known_count == 0) {
+      throw std::runtime_error(
+              "Ground step rejection removed every cell. Raise ground_max_step "
+              "or set it to 0.0 to disable the check.");
+    }
+  }
+
+  // Breadth-first flood fill from the known cells, so every unobserved cell
+  // takes the value of its nearest known neighbour in grid distance.
+  static void fillNearest(GroundGrid & g, const std::vector<uint8_t> & known)
+  {
+    std::vector<uint8_t> seen = known;
+    std::deque<std::pair<int, int>> q;
+
+    for (int y = 0; y < g.height; ++y) {
+      for (int x = 0; x < g.width; ++x) {
+        const size_t idx =
+          static_cast<size_t>(y) * static_cast<size_t>(g.width) +
+          static_cast<size_t>(x);
+        if (seen[idx]) {
+          q.emplace_back(y, x);
+        }
+      }
+    }
+
+    while (!q.empty()) {
+      const auto [y, x] = q.front();
+      q.pop_front();
+      const size_t idx =
+        static_cast<size_t>(y) * static_cast<size_t>(g.width) +
+        static_cast<size_t>(x);
+      const double v = g.z[idx];
+
+      const int dys[4] = {-1, 1, 0, 0};
+      const int dxs[4] = {0, 0, -1, 1};
+      for (int k = 0; k < 4; ++k) {
+        const int ny = y + dys[k];
+        const int nx = x + dxs[k];
+        if (nx < 0 || nx >= g.width || ny < 0 || ny >= g.height) {
+          continue;
+        }
+        const size_t n_idx =
+          static_cast<size_t>(ny) * static_cast<size_t>(g.width) +
+          static_cast<size_t>(nx);
+        if (seen[n_idx]) {
+          continue;
+        }
+        seen[n_idx] = 1;
+        g.z[n_idx] = v;
+        q.emplace_back(ny, nx);
+      }
+    }
+  }
+
+  // 3x3 box blur with edge clamping, blended by alpha. Removes the blocky
+  // steps the per-cell statistic leaves behind, so the relative slice does
+  // not develop seams along cell borders.
+  void smoothGrid(GroundGrid & g) const
+  {
+    const int passes = std::max(0, ground_smooth_passes_);
+    const double alpha = std::clamp(ground_smooth_alpha_, 0.0, 1.0);
+    if (passes == 0 || alpha == 0.0) {
+      return;
+    }
+
+    std::vector<double> next(g.z.size());
+    for (int p = 0; p < passes; ++p) {
+      for (int y = 0; y < g.height; ++y) {
+        for (int x = 0; x < g.width; ++x) {
+          double sum = 0.0;
+          for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+              const int ny = std::clamp(y + dy, 0, g.height - 1);
+              const int nx = std::clamp(x + dx, 0, g.width - 1);
+              sum += g.z[
+                static_cast<size_t>(ny) * static_cast<size_t>(g.width) +
+                static_cast<size_t>(nx)];
+            }
+          }
+          const size_t idx =
+            static_cast<size_t>(y) * static_cast<size_t>(g.width) +
+            static_cast<size_t>(x);
+          next[idx] = (1.0 - alpha) * g.z[idx] + alpha * (sum / 9.0);
+        }
+      }
+      g.z.swap(next);
+    }
+  }
+
+  // CSF's cloth can only follow terrain while the height change between two
+  // adjacent cloth particles stays small; past roughly 0.3 m per particle
+  // spacing the cloth bridges the slope instead of draping onto it and whole
+  // regions come back unclassified. The recovered surface tells us the slope,
+  // so the check can be made after the fact.
+  void warnOnSteepness(const GroundGrid & g) const
+  {
+    if (ground_method_ != "csf") {
+      return;
+    }
+
+    std::vector<double> diffs;
+    diffs.reserve(g.z.size());
+    for (int y = 0; y < g.height; ++y) {
+      for (int x = 0; x + 1 < g.width; ++x) {
+        const size_t i =
+          static_cast<size_t>(y) * static_cast<size_t>(g.width) +
+          static_cast<size_t>(x);
+        diffs.push_back(std::fabs(g.z[i + 1] - g.z[i]));
+      }
+    }
+    if (diffs.size() < 20) {
+      return;
+    }
+
+    const size_t k = static_cast<size_t>(0.95 * static_cast<double>(diffs.size() - 1));
+    std::nth_element(diffs.begin(), diffs.begin() + static_cast<long>(k), diffs.end());
+    const double slope = diffs[k] / g.cell;          // metres per metre
+    const double step = slope * csf_cloth_resolution_;
+
+    RCLCPP_INFO(get_logger(),
+      "Ground slope (95th percentile): %.3f m/m = %.1f deg; "
+      "height step per cloth particle: %.3f m",
+      slope, std::atan(slope) * 180.0 / M_PI, step);
+
+    if (step > 0.30) {
+      // The slope is measured from the surface CSF produced. If the cloth
+      // already failed, that surface is flatter than the real terrain, so
+      // this suggestion is an upper bound rather than a safe value.
+      RCLCPP_WARN(get_logger(),
+        "Height step per cloth particle is %.3f m, above the ~0.3 m that CSF "
+        "can drape over. Try csf_cloth_resolution %.2f m or less, and keep "
+        "halving it while this warning persists.",
+        step, 0.30 / std::max(slope, 1e-6));
+    }
+  }
+
+  // Bilinear sample of the ground surface at an arbitrary XY position.
+  static double sampleGround(const GroundGrid & g, double px, double py)
+  {
+    const double fx = (px - g.x_min) / g.cell;
+    const double fy = (py - g.y_min) / g.cell;
+    const int x0 = std::clamp(static_cast<int>(std::floor(fx)), 0, g.width - 2);
+    const int y0 = std::clamp(static_cast<int>(std::floor(fy)), 0, g.height - 2);
+    const double tx = std::clamp(fx - static_cast<double>(x0), 0.0, 1.0);
+    const double ty = std::clamp(fy - static_cast<double>(y0), 0.0, 1.0);
+
+    const size_t w = static_cast<size_t>(g.width);
+    const size_t i00 = static_cast<size_t>(y0) * w + static_cast<size_t>(x0);
+    const size_t i10 = i00 + 1;
+    const size_t i01 = i00 + w;
+    const size_t i11 = i01 + 1;
+
+    return (1.0 - tx) * (1.0 - ty) * g.z[i00] +
+           tx * (1.0 - ty) * g.z[i10] +
+           (1.0 - tx) * ty * g.z[i01] +
+           tx * ty * g.z[i11];
+  }
+
+  CloudT::Ptr groundRelativeSlice(const CloudT::Ptr & input)
+  {
+    if (thre_z_min_ >= thre_z_max_) {
+      throw std::runtime_error("thre_z_min must be less than thre_z_max");
+    }
+
+    GroundGrid g;
+    if (ground_method_ == "csf") {
+      const CloudT::Ptr ground = csfGroundPoints(input);
+      g = buildGroundGrid(input, ground, CellStat::kMean);
+    } else if (ground_method_ == "grid") {
+      g = buildGroundGrid(input, input, CellStat::kPercentile);
+    } else {
+      throw std::runtime_error(
+              "ground_method must be \"csf\" or \"grid\", got \"" +
+              ground_method_ + "\"");
+    }
+
+    if (save_intermediate_) {
+      writeGroundSurface(g);
+    }
+
+    auto out = std::make_shared<CloudT>();
+    out->points.reserve(input->points.size() / 4 + 1);
+
+    double rel_min = std::numeric_limits<double>::max();
+    double rel_max = std::numeric_limits<double>::lowest();
+
+    for (const auto & p : input->points) {
+      if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+        continue;
+      }
+      const double ground_z = sampleGround(g, p.x, p.y);
+      const double rel = static_cast<double>(p.z) - ground_z;
+      rel_min = std::min(rel_min, rel);
+      rel_max = std::max(rel_max, rel);
+
+      const bool inside = (rel >= thre_z_min_) && (rel <= thre_z_max_);
+      if (inside == flag_pass_through_) {
+        continue;
+      }
+      out->points.push_back(p);
+    }
+
+    out->width = static_cast<uint32_t>(out->points.size());
+    out->height = 1;
+    out->is_dense = false;
+
+    RCLCPP_INFO(get_logger(),
+      "Relative height range in cloud: [%.3f, %.3f] m", rel_min, rel_max);
+    RCLCPP_INFO(get_logger(),
+      "After ground-relative slice [%.3f, %.3f]: %zu points (from %zu)",
+      thre_z_min_, thre_z_max_, out->points.size(), input->points.size());
+
+    if (save_intermediate_ && !out->points.empty()) {
+      pcl::io::savePCDFileBinary(output_base_.string() + "_pass.pcd", *out);
+    }
+    return out;
+  }
+
+  // Dumps the estimated ground as a point per cell, so it can be overlaid on
+  // the input cloud in a viewer to check the surface before trusting a slice.
+  void writeGroundSurface(const GroundGrid & g) const
+  {
+    auto surface = std::make_shared<CloudT>();
+    surface->points.reserve(g.z.size());
+    for (int y = 0; y < g.height; ++y) {
+      for (int x = 0; x < g.width; ++x) {
+        PointT p;
+        p.x = static_cast<float>(g.x_min + (static_cast<double>(x) + 0.5) * g.cell);
+        p.y = static_cast<float>(g.y_min + (static_cast<double>(y) + 0.5) * g.cell);
+        p.z = static_cast<float>(
+          g.z[static_cast<size_t>(y) * static_cast<size_t>(g.width) +
+          static_cast<size_t>(x)]);
+        surface->points.push_back(p);
+      }
+    }
+    surface->width = static_cast<uint32_t>(surface->points.size());
+    surface->height = 1;
+    surface->is_dense = true;
+    pcl::io::savePCDFileBinary(
+      output_base_.string() + "_ground_surface.pcd", *surface);
+  }
+
+  // ---------------------------------------------------------------------
+  // Rasterisation and output
+  // ---------------------------------------------------------------------
 
   struct Bounds
   {
@@ -497,6 +1206,31 @@ private:
 
   fs::path input_pcd_;
   fs::path output_base_;   // no extension
+
+  bool use_statistical_filter_{false};
+  int sor_mean_k_{30};
+  double sor_std_ratio_{1.0};
+
+  bool use_coarse_z_filter_{false};
+  double coarse_z_min_{-5.0};
+  double coarse_z_max_{5.0};
+
+  bool use_ground_relative_slice_{false};
+  std::string ground_method_{"csf"};
+
+  bool csf_slope_smooth_{true};
+  double csf_cloth_resolution_{0.5};
+  int csf_rigidness_{2};
+  double csf_class_threshold_{0.2};
+  int csf_max_iterations_{500};
+  double csf_time_step_{0.65};
+
+  double ground_cell_size_{1.0};
+  int ground_min_points_per_cell_{5};
+  double ground_percentile_{0.05};
+  double ground_max_step_{0.5};
+  int ground_smooth_passes_{2};
+  double ground_smooth_alpha_{0.5};
 
   bool use_voxel_filter_{false};
   bool voxel_before_height_filter_{false};

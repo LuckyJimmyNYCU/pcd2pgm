@@ -6,7 +6,7 @@ pcd2pgm:
     # ======================================================================
     # Reads:  <world_directory>/<input_subdir>/<map_name>.pcd
     # Writes: <world_directory>/<output_subdir>/<map_name>/<map_name>.pgm + .yaml
-    map_name: "live_map_8f"
+    map_name: "live_map_1f"
 
     world_directory: "/work/nav2_ws/src/world"
     input_subdir: "PCD"
@@ -24,19 +24,167 @@ pcd2pgm:
     output_name: ""
 
     # ======================================================================
-    # Voxel downsampling (applied to the raw cloud, before every other filter)
+    # Statistical outlier removal (SOR)
     # ======================================================================
-    # Keeps one point per voxel. Speeds up the height and radius filters and
-    # evens out the density, which makes the radius filter behave consistently
-    # across the map. Map bounds still come from the full cloud, so switching
-    # this on does not move the origin or change the map size.
+    # Drops points whose mean distance to their sor_mean_k nearest neighbours
+    # is more than sor_std_ratio standard deviations above the cloud average.
+    # This is pure denoising: it removes LiDAR speckle and stray points far
+    # from any surface. It does NOT remove the ground.
+    #
+    # Runs first in the pipeline, before the ground surface is estimated.
+    # Points floating below the floor are the main thing that corrupts a
+    # ground estimate, so turn this on if the PCD is at all noisy.
+    #
+    # Cost: builds a KD-tree over the whole cloud, so on a cloud of several
+    # million points this is the slowest stage by a wide margin.
+    use_statistical_filter: true
+    sor_mean_k: 30
+    sor_std_ratio: 1.0
+
+    # ======================================================================
+    # Coarse absolute-z crop
+    # ======================================================================
+    # Optional wide crop applied before the ground surface is estimated.
+    # Use it to throw away sky, ceilings and gross z outliers so they cannot
+    # distort the surface. Keep the limits generous: this is not the slice,
+    # it only needs to contain the whole floor plus the obstacle band.
+    use_coarse_z_filter: true
+    coarse_z_min: -1.0
+    coarse_z_max: 6.0
+
+    # ======================================================================
+    # Height filter mode
+    # ======================================================================
+    # false: thre_z_min / thre_z_max are absolute heights in the map frame.
+    #        Fine on a small, level map. Outdoors, or on any large map where
+    #        the ground rises, falls or drifts, one absolute band cannot
+    #        follow it: part of the ground lands inside the band and turns
+    #        into obstacles, while elsewhere real obstacles fall outside the
+    #        band and disappear.
+    #
+    # true:  A local ground surface is estimated first, and the band is
+    #        measured from that surface. A sloping ground then yields one
+    #        consistent slice everywhere.
+    #
+    # Switching this on usually does not require changing thre_z_min /
+    # thre_z_max: 0.15 ~ 0.65 above the local ground is the same intent as
+    # 0.15 ~ 0.65 above z = 0, just measured correctly.
+    use_ground_relative_slice: true
+
+    # How the ground surface is estimated.
+    #
+    #   "csf"  Cloth Simulation Filter (Zhang et al. 2016). Inverts the cloud
+    #          and drapes a simulated cloth over it, so the cloth settles on
+    #          the ground rather than on vegetation or rooftops. Handles
+    #          slopes and separates low vegetation from the ground properly.
+    #          This is the right choice outdoors.
+    #
+    #   "grid" Per-cell low percentile of the raw cloud. No simulation, so it
+    #          is faster and has nothing to tune, but on a slope the estimate
+    #          lags the true ground and anything sitting on the ground can
+    #          pull the estimate up with it. Adequate indoors.
+    ground_method: "csf"
+
+    # ---- CSF parameters (only used when ground_method is "csf") ----------
+    # Same names and meanings as the reference implementation, so values that
+    # work in the Python CSF module carry over unchanged.
+
+    # THE parameter to get right. It sets the spacing of the cloth particles.
+    #
+    # The cloth can only follow the ground while the height change between
+    # two adjacent particles stays under roughly 0.3 m. Past that the cloth
+    # bridges the slope instead of draping onto it, and whole regions come
+    # back with no ground points at all. So:
+    #
+    #     csf_cloth_resolution  <=  0.3 / tan(steepest slope)
+    #
+    #   flat site, up to  5 deg   ->  2.0 m is fine
+    #   rolling, up to   15 deg   ->  1.0 m
+    #   ramps,   up to   20 deg   ->  0.8 m
+    #   steep,   up to   30 deg   ->  0.5 m
+    #   very steep,      45 deg   ->  0.25 m
+    #
+    # When in doubt go smaller: the cost is roughly linear in particle count
+    # and the whole filter is only a second or two on a few million points.
+    # The node measures the recovered slope and warns when this limit is
+    # exceeded, so the log will tell you if the value is too large.
+    csf_cloth_resolution: 0.5
+
+    # 1 = soft cloth, follows rough terrain most closely
+    # 2 = balanced, a good default outdoors
+    # 3 = stiff cloth, best on genuinely flat ground
+    # Has much less influence than csf_cloth_resolution.
+    csf_rigidness: 2
+
+    # A point within this distance of the settled cloth is classified as
+    # ground. The upstream default of 0.5 comes from airborne survey work and
+    # is far too large for a ground robot: it swallows kerbs, pallets and
+    # anything else shorter than half a metre into the ground class, which
+    # then lifts the estimated surface and hides those obstacles from the
+    # slice. 0.1 ~ 0.2 is the useful range here.
+    csf_class_threshold: 0.2
+
+    # Simulation stops early once the cloth stops moving, so raising this
+    # rarely changes anything. If the cloth is failing, the fix is
+    # csf_cloth_resolution, not more iterations.
+    csf_max_iterations: 500
+
+    # Integration step. Leave at the reference value unless you have a reason.
+    csf_time_step: 0.65
+
+    # Post-processing pass for steep slopes. Keep it on outdoors.
+    csf_slope_smooth: true
+
+    # ---- Ground surface reconstruction -----------------------------------
+    # The classified ground points are averaged into an XY grid, empty cells
+    # are filled from their nearest neighbour, the grid is smoothed, and each
+    # point's local ground height is read back by bilinear interpolation.
+
+    # XY cell size for that grid, in metres. Roughly matching
+    # csf_cloth_resolution is a good starting point. Smaller cells track the
+    # terrain more closely but leave more empty cells to be filled in.
+    ground_cell_size: 0.5
+
+    # A cell needs at least this many ground points before it is trusted.
+    # Cells below the threshold are treated as unobserved and filled from the
+    # nearest known cell. With ground_method "csf" a low value (1 ~ 3) is
+    # usually right, since CSF has already done the classification.
+    ground_min_points_per_cell: 1
+
+    # Only used by ground_method "grid": which z within a cell counts as the
+    # ground. 0.0 takes the lowest point; 0.05 takes the 5th percentile,
+    # which ignores a few stray points below the ground. Ignored by "csf".
+    ground_percentile: 0.05
+
+    # Cells further than this from the median of their known neighbours are
+    # discarded and refilled from their surroundings. Catches cells whose
+    # only returns are a roof, a parked vehicle or a pallet, which would
+    # otherwise lift the local ground and hide obstacles standing on it.
+    # Set 0.0 to disable. Raise it on genuinely steep or broken terrain,
+    # where a real one-cell height change can legitimately exceed it.
+    ground_max_step: 0.0
+
+    # 3x3 box blur over the ground grid. Removes the blocky steps left by the
+    # per-cell statistic, so the slice does not develop seams along cell
+    # borders. alpha is the blend weight per pass, 0.0 ~ 1.0.
+    ground_smooth_passes: 2
+    ground_smooth_alpha: 0.35
+
+    # ======================================================================
+    # Voxel downsampling
+    # ======================================================================
+    # Keeps one point per voxel. Speeds up the radius filter and evens out the
+    # density, which makes that filter behave consistently across the map.
+    # Map bounds still come from the full cloud, so switching this on does not
+    # move the origin or change the map size.
     use_voxel_filter: true
 
     # false: downsample AFTER the height filter (recommended). The height band
     #        has already collapsed the z extent, so the voxel grid stays small.
     # true:  downsample BEFORE the height filter. The grid then has to span the
     #        full z range of the cloud, which on a multi-floor or drifted scan
-    #        can exceed PCL's int32 cell index and abort.
+    #        can exceed PCL's int32 cell index and abort. It also thins the
+    #        cloud that CSF runs on.
     voxel_before_height_filter: false
 
     # Leaf size in metres. leaf_x / leaf_y at or below map_resolution keeps
@@ -51,8 +199,10 @@ pcd2pgm:
     # 1 = plain downsampling. 2 or 3 also drops isolated noise.
     voxel_min_points_per_voxel: 1
 
-    thre_z_min: -0.5
-    thre_z_max: 0.65
+    # Absolute heights when use_ground_relative_slice is false.
+    # Heights above the local ground when it is true.
+    thre_z_min: 0.4
+    thre_z_max: 0.8
 
     # false = keep points within the specified height range
     # true  = keep points outside the specified height range
@@ -80,5 +230,11 @@ pcd2pgm:
     # false: Only bound the map around the filtered obstacle points.
     bounds_from_full_cloud: true
 
-    # Save <output>_pass.pcd and <output>_radius.pcd for inspection.
+    # Save intermediate clouds next to the output for inspection:
+    #   _sor.pcd             after statistical outlier removal
+    #   _csf_ground.pcd      the points CSF classified as ground
+    #   _ground_surface.pcd  the reconstructed surface, one point per cell
+    #   _pass.pcd            after the height filter
+    #   _voxel.pcd           after voxel downsampling
+    #   _radius.pcd          after radius outlier removal
     save_intermediate: true
