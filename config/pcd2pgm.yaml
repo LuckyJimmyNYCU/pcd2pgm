@@ -6,7 +6,7 @@ pcd2pgm:
     # ======================================================================
     # Reads:  <world_directory>/<input_subdir>/<map_name>.pcd
     # Writes: <world_directory>/<output_subdir>/<map_name>/<map_name>.pgm + .yaml
-    map_name: "live_map_1f"
+    map_name: "live_map_8f"
 
     world_directory: "/work/nav2_ws/src/world"
     input_subdir: "PCD"
@@ -201,8 +201,8 @@ pcd2pgm:
 
     # Absolute heights when use_ground_relative_slice is false.
     # Heights above the local ground when it is true.
-    thre_z_min: 0.4
-    thre_z_max: 0.8
+    thre_z_min: 0.3
+    thre_z_max: 1.0
 
     # false = keep points within the specified height range
     # true  = keep points outside the specified height range
